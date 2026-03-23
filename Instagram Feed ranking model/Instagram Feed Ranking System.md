@@ -2,11 +2,6 @@
 
 A complete, interview-ready and revision-friendly guide to designing an Instagram Feed Ranking system.
 
-This README is written so that:
-- a student can revise it quickly,
-- an interview candidate can explain it confidently,
-- and the design stays structured from requirements to ML training and serving.
-
 ---
 
 ## 1. Functional Requirements
