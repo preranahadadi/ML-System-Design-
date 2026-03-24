@@ -1,9 +1,5 @@
 # Instagram Feed ranking model
 
-A complete, interview-ready and revision-friendly guide to designing an Instagram Feed Ranking system.
-
----
-
 ## 1. Functional Requirements
 
 ### Core Product Requirements
@@ -130,8 +126,6 @@ A good way to explain this is:
 ---
 
 ## 5. Data and Features
-
-This is one of the most important interview sections.
 
 For feed ranking, features usually come from five major buckets.
 
@@ -322,9 +316,6 @@ Possible models:
 - multi-task neural networks,
 - DeepFM or similar ranking DNN variants.
 
-A strong interview answer is:
-
-> I would likely use a multi-task ranking model because feed quality depends on multiple engagement objectives like likes, comments, saves, shares, and dwell time.
 
 ### D. Multi-Task Learning
 Instead of predicting just one label, the model predicts multiple outcomes:
@@ -450,8 +441,6 @@ Compare the new model against the production model using A/B testing.
 
 ## 9. Offline Training vs Online Serving
 
-Interviewers like this distinction a lot.
-
 ### Offline
 Heavy computations happen here:
 - model training,
@@ -467,10 +456,6 @@ Fast computations happen here:
 - infer model scores,
 - rerank,
 - return the feed response.
-
-A strong interview line is:
-
-> Offline computes expensive intelligence, while online uses it under tight latency constraints.
 
 ---
 
@@ -490,6 +475,7 @@ This happens before production rollout.
 - MAP@k.
 
 For feed ranking, **NDCG@k** is especially strong to mention because ranking order matters.
+Normalized Discounted Cumulative Gain (NDCG) is a premier ranking metric used to evaluate search engines and recommendation systems by measuring ranking quality based on graded relevance.
 
 #### Multi-Objective Evaluation
 Evaluate performance on:
@@ -535,10 +521,6 @@ Monitor:
 - new creator exposure,
 - spam exposure,
 - negative feedback rate.
-
-A very strong line to say in an interview is:
-
-> I would not ship a ranking model purely on better CTR if it worsens hide rate, policy risk, or latency.
 
 ---
 
@@ -598,8 +580,6 @@ Without exploration:
 
 ## 13. Data Infrastructure and Feature Store
 
-This is good to mention briefly in interviews.
-
 ### Offline Feature Store
 Stores:
 - historical aggregates,
@@ -613,15 +593,6 @@ Stores:
 - current session features,
 - last active time,
 - fresh engagement counters.
-
-### Important Concern: Training-Serving Skew
-The same feature definitions must be used in both training and serving.
-Otherwise, the model performs well offline but poorly online.
-
-A very interview-friendly phrase is:
-
-> I would avoid training-serving skew by using shared feature definitions between offline training and online inference.
-
 ---
 
 ## 14. Model Retraining Strategy
