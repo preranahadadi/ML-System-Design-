@@ -1,0 +1,385 @@
+# Ad Click Prediction System — ML System Design
+
+---
+
+## 1. Problem Statement
+
+Design an ML system that predicts the probability that a user will click on a given ad. This predicted Click-Through Rate (pCTR) is used to rank ads in real time and decide which ad to serve to a user.
+
+**Core ML Task:** Binary Classification  
+**Output:** pCTR ∈ [0, 1] — probability that a user clicks on an ad
+
+---
+
+## 2. Requirements
+
+### 2.1 Functional Requirements
+
+- Given a user and a set of candidate ads, return a ranked list of ads ordered by predicted click probability
+- Support real-time inference — prediction must be served within the ad auction pipeline
+- Re-train the model periodically to capture evolving user behavior and ad trends
+- Log all impressions, clicks, and non-clicks for training data collection
+- Support A/B testing to compare model versions before full rollout
+
+### 2.2 Non-Functional Requirements
+
+- **Latency:** End-to-end prediction under 100ms at p99 (ads must be ranked before the page loads)
+- **Throughput:** Handle 500K–1M prediction requests per second at peak
+- **Availability:** 99.99% uptime — a serving outage directly loses revenue
+- **Scalability:** System must scale horizontally as traffic grows
+- **Consistency:** Slight staleness in features (a few minutes) is acceptable; strong consistency not required
+- **Fault Tolerance:** Fallback to a simpler model or rule-based ranking if ML service is down
+
+---
+
+## 3. Scale Estimation
+
+| Metric | Estimate |
+|---|---|
+| Daily Active Users | 500M |
+| Ad impressions per day | 10B |
+| Avg candidates scored per request | 100–500 ads |
+| Peak QPS (queries per second) | ~500K–1M |
+| Training data size (30 days) | ~500B rows (after downsampling) |
+| Click rate (positive label rate) | 1–5% → heavily imbalanced |
+| Feature store read latency required | < 10ms |
+
+---
+
+## 4. Data Collection & Labeling
+
+### 4.1 Label Definition
+
+| Event | Label |
+|---|---|
+| User clicks on ad | `y = 1` (positive) |
+| Ad shown, no click (within 30s window) | `y = 0` (negative) |
+
+**Label delay:** Clicks can arrive seconds to minutes after impression. A time window (e.g., 30 seconds to 1 hour) is defined. This creates a **delayed feedback problem** — recent data may have incomplete labels.
+
+### 4.2 Data Sources
+
+- **Impression logs:** ad_id, user_id, timestamp, features used at serving time
+- **Click logs:** ad_id, user_id, click_timestamp
+- **User activity logs:** browsing history, search queries, past purchases
+- **Ad metadata:** advertiser, category, format, bid price, historical CTR
+
+### 4.3 Class Imbalance
+
+Only ~1–5% of impressions result in a click. Strategies to handle this:
+
+- **Negative downsampling:** Randomly drop ~90–99% of negative examples during training. Adjust predicted probabilities at serving time using calibration correction: `p_corrected = p / (p + (1-p)/w)` where `w` is the downsampling rate
+- **Weighted loss function:** Assign higher weight to positive class in the loss function
+- **Evaluation on full data:** Always evaluate on the full unsampled dataset to get unbiased metrics
+
+---
+
+## 5. Feature Engineering
+
+### 5.1 Feature Categories
+
+**User Features**
+- Demographics: age bucket, gender, location (country, city)
+- Device: device type, OS, browser
+- Behavioral: past CTR (last 1d / 7d / 30d), categories clicked, avg session length
+- Temporal: hour of day, day of week
+
+**Ad Features**
+- Ad category, subcategory
+- Advertiser ID
+- Ad format (banner, video, native)
+- Historical CTR of the ad (last 1d / 7d / 30d)
+- Bid price
+
+**User × Ad Interaction Features (Cross Features)**
+- User category affinity × Ad category (did user previously click ads in this category?)
+- User device × Ad format (video ads perform differently on mobile vs desktop)
+- Time of day × Ad category
+
+**Context Features**
+- Page/placement where ad is shown
+- Position on page (position bias — top positions get more clicks regardless of relevance)
+
+### 5.2 Feature Storage
+
+| Feature type | Storage | Update frequency |
+|---|---|---|
+| Real-time user features (last 1hr clicks) | Redis (in-memory) | Streaming, near real-time |
+| Historical user aggregates (7d, 30d) | Feature store (e.g., Feast + DynamoDB) | Batch, daily |
+| Ad metadata + historical CTR | Key-value store (DynamoDB) | Hourly |
+| Static features (demographics) | Feature store, cached | Daily |
+
+---
+
+## 6. Model Design
+
+### 6.1 Candidate Models
+
+| Model | Pros | Cons |
+|---|---|---|
+| Logistic Regression | Fast, interpretable, low latency | Cannot capture non-linear interactions |
+| Gradient Boosted Trees (LightGBM / XGBoost) | Handles tabular data well, fast to train | Hard to capture high-order feature interactions |
+| Wide & Deep (Google, 2016) | Combines memorization (wide) + generalization (deep) | More complex to train and serve |
+| DeepFM | Learns pairwise and higher-order feature interactions automatically | Heavier at serving time |
+| Two-Tower Model | Scales to millions of candidates via approximate nearest neighbor | Less accurate than full cross-attention models |
+
+### 6.2 Recommended Architecture: Wide & Deep + GBDT Ensemble
+
+- Use **LightGBM** as a strong baseline and for feature importance analysis
+- Promote to **Wide & Deep** or **DeepFM** for production if offline metrics justify the latency tradeoff
+- Use **calibration layer** (Platt scaling or isotonic regression) on top of the model output to ensure predicted probabilities are well-calibrated
+
+### 6.3 Loss Function
+
+Binary cross-entropy (log loss):
+
+```
+Loss = -[y * log(p) + (1-y) * log(1-p)]
+```
+
+Optionally: **Focal Loss** to down-weight easy negatives and focus training on hard examples.
+
+---
+
+## 7. Training Pipeline
+
+```
+Raw impression + click logs (S3 / HDFS)
+          ↓
+Spark batch job: join impressions with clicks, generate labels
+          ↓
+Feature extraction + joining with feature store snapshots
+          ↓
+Negative downsampling (keep 100% positives, 10% negatives)
+          ↓
+Train / Validation / Test split (time-based — DO NOT shuffle chronologically)
+          ↓
+Model training (LightGBM or Deep CTR model)
+          ↓
+Offline evaluation (AUC-ROC, Log Loss, calibration check)
+          ↓
+If metrics pass threshold → push to model registry (MLflow / SageMaker)
+          ↓
+Shadow mode deployment → compare with current production model offline
+          ↓
+A/B test in production → promote if online metrics improve
+```
+
+**Important:** Always use a **time-based split** (train on past, test on future). Never use random shuffle — that causes data leakage and inflates offline metrics.
+
+**Retraining cadence:** Daily full retrain + hourly fine-tuning on recent data to handle trend drift.
+
+---
+
+## 8. Serving / Inference Architecture
+
+### 8.1 Request Flow
+
+```
+1. Ad request arrives (user opens page)
+2. Candidate generation layer retrieves top N candidate ads (100–500)
+3. Feature server fetches real-time user features from Redis
+4. Feature server fetches ad features from DynamoDB
+5. Features assembled → sent to ML inference service
+6. Model scores all candidates in a single batched forward pass
+7. Scores returned → ads ranked → top K selected
+8. Ad shown to user; impression event logged asynchronously
+```
+
+### 8.2 Latency Budget (100ms total)
+
+| Step | Budget |
+|---|---|
+| Network + routing | ~5ms |
+| Candidate retrieval | ~10ms |
+| Feature fetching (Redis + DynamoDB) | ~10–15ms |
+| ML model inference | ~20–30ms |
+| Ranking + auction logic | ~5ms |
+| Response + rendering | ~10ms |
+
+### 8.3 Inference Optimizations
+
+- **Batch scoring:** Score all candidates in a single batched call, not one by one
+- **Model quantization (INT8):** Reduce model size and speed up inference with minimal accuracy loss
+- **ONNX / TorchScript export:** Serve models in optimized runtime
+- **Caching:** Cache predictions for (user, ad) pairs seen very recently
+- **Feature pre-fetching:** Start fetching features in parallel with candidate retrieval
+
+---
+
+## 9. Feedback Loop & Online Learning
+
+```
+Ad served → user clicks or doesn't
+        ↓
+Event streamed via Kafka
+        ↓
+Flink streaming job joins click events with impression events (within 30s window)
+        ↓
+Labeled training example written to data lake (S3)
+        ↓
+Feeds daily batch retrain + optional real-time feature updates
+```
+
+**Challenge — Feedback delay:** A user might click an ad 10 minutes after seeing it. Solution: hold a join window (e.g., up to 1 hour) before finalizing the label for recent impressions.
+
+**Challenge — Position bias:** Ads shown in higher positions get more clicks regardless of true relevance. Handle with **position feature** during training, and **dropout of position at serving time** (set position=0 or use a separate debiasing model).
+
+---
+
+## 10. Offline Evaluation Metrics
+
+| Metric | Why it matters |
+|---|---|
+| **AUC-ROC** | Measures ranking quality — can the model rank clicked ads above non-clicked ads? |
+| **Log Loss (Cross-Entropy)** | Measures calibration — are predicted probabilities accurate? |
+| **Normalized Cross-Entropy (NCE)** | Log loss normalized by the baseline model (prior CTR). NCE > 1 means our model is better than just predicting the average CTR |
+| **Calibration Plot** | Plot predicted probability bins vs actual click rate — should be a diagonal line |
+| **Precision @ K** | Of the top K ads ranked, how many actually got clicked? |
+
+**Do NOT use accuracy** — with 99% negatives, a model that always predicts 0 gets 99% accuracy but is useless.
+
+---
+
+## 11. Online Evaluation Metrics
+
+| Metric | Description |
+|---|---|
+| **CTR (Click-Through Rate)** | Clicks / Impressions — primary business metric |
+| **RPM (Revenue per Mille)** | Revenue per 1000 impressions |
+| **CVR (Conversion Rate)** | Post-click conversions (purchases, signups) |
+| **p99 Latency** | Tail latency of inference service |
+| **Model staleness** | Time since last retrain — monitor for concept drift |
+
+---
+
+## 12. Monitoring & Alerting
+
+### 12.1 Data Quality Monitoring
+- Feature distribution drift (PSI — Population Stability Index) between training and serving
+- Missing feature rate per feature — alert if > 5% nulls appear suddenly
+- Label delay monitoring — alert if click join rate drops (may indicate logging failure)
+
+### 12.2 Model Performance Monitoring
+- **Online AUC:** Computed on a held-out slice of live traffic daily
+- **CTR degradation:** Alert if CTR drops > 10% compared to 7-day rolling average
+- **Prediction distribution shift:** Monitor histogram of predicted pCTR over time
+
+### 12.3 Infrastructure Monitoring
+- Inference latency (p50, p95, p99)
+- Feature store read latency and error rate
+- Kafka consumer lag (indicates feedback loop delays)
+- Model serving throughput (QPS) and error rate
+
+### 12.4 Alerting Thresholds
+
+| Signal | Alert condition |
+|---|---|
+| p99 latency | > 150ms |
+| Feature missing rate | > 5% for any critical feature |
+| Online AUC | Drops > 2% vs baseline |
+| CTR | Drops > 10% vs 7-day average |
+| Model age | > 48 hours without successful retrain |
+
+---
+
+## 13. A/B Testing & Rollout Strategy
+
+```
+New model trained and validated offline
+        ↓
+Shadow mode: new model scores requests in parallel but doesn't affect serving
+  → Compare offline predictions between old and new model
+        ↓
+Canary rollout: serve new model to 1–5% of traffic
+  → Monitor latency, CTR, error rate
+        ↓
+A/B test: 50/50 split between old and new model
+  → Run for minimum 1–2 weeks (to cover weekly seasonality)
+  → Analyze CTR, RPM, CVR with statistical significance (p < 0.05)
+        ↓
+Full rollout if metrics are neutral or positive
+        ↓
+Old model kept on standby for 24–48hrs for quick rollback
+```
+
+---
+
+## 14. Key Challenges & Trade-offs
+
+| Challenge | Trade-off / Solution |
+|---|---|
+| **Latency vs Accuracy** | A more complex model (DeepFM) may improve AUC by 0.5% but add 30ms latency — evaluate if business impact justifies the cost |
+| **Exploration vs Exploitation** | Always serving the highest pCTR ad means we never explore new ads. Use epsilon-greedy or contextual bandits to balance |
+| **Cold Start (new user)** | No history → use demographic defaults, popular ads, or content-based signals |
+| **Cold Start (new ad)** | No historical CTR → use advertiser-level CTR, category-level CTR as prior |
+| **Position Bias** | Ads shown at top get more clicks by default. Use position debiasing during training |
+| **Concept Drift** | User interests and ad trends change over time. Mitigate with frequent retraining and higher weight on recent data |
+| **Training-Serving Skew** | Features computed differently offline vs online lead to silent model degradation. Log features at serving time and use them for training |
+
+---
+
+## 15. System Architecture Diagram
+
+```
+                          ┌─────────────────────────────┐
+                          │        AD REQUEST            │
+                          └──────────────┬──────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │    Candidate Generation      │
+                          │  (retrieve top 500 ads)      │
+                          └──────────────┬──────────────┘
+                                         │
+               ┌─────────────────────────▼────────────────────────┐
+               │                Feature Assembly                    │
+               │  Redis (real-time)  +  DynamoDB (ad/user history) │
+               └─────────────────────────┬────────────────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │      ML Inference Service    │
+                          │  (batch score all candidates)│
+                          └──────────────┬──────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │       Ranking + Auction      │
+                          │    (pCTR × bid price = eCPM) │
+                          └──────────────┬──────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │          Show Ad             │
+                          └──────────────┬──────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │     Kafka Event Stream       │
+                          │  (impression + click logs)   │
+                          └──────┬──────────────┬────────┘
+                                 │              │
+                    ┌────────────▼───┐   ┌──────▼──────────────┐
+                    │  Flink Stream  │   │  S3 / Data Lake      │
+                    │  (label joins) │   │  (batch training)    │
+                    └────────────────┘   └──────────────────────┘
+```
+
+---
+
+## 16. Tech Stack
+
+| Component | Technology |
+|---|---|
+| Data processing (batch) | Apache Spark |
+| Data processing (streaming) | Apache Flink |
+| Message queue | Apache Kafka |
+| Feature store (real-time) | Redis |
+| Feature store (batch) | Feast + DynamoDB |
+| Data lake | S3 + Parquet |
+| Model training | LightGBM / PyTorch |
+| Experiment tracking | MLflow |
+| Model registry | MLflow / SageMaker Model Registry |
+| Model serving | TorchServe / Triton Inference Server |
+| Orchestration | Airflow (batch), Kubernetes (serving) |
+| Monitoring | Grafana + Prometheus + custom drift monitors |
+| A/B testing | Internal experimentation platform |
+
+---
+
